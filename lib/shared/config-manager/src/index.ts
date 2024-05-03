@@ -1,6 +1,7 @@
-import { DVCLogger } from '@devcycle/types'
+import { ConfigBody, DVCLogger } from '@devcycle/types'
 import { getEnvironmentConfig } from './request'
 import { ResponseError, UserError } from '@devcycle/server-request'
+import { SSEConnection } from '@devcycle/sse-connection'
 
 type ConfigPollingOptions = {
     configPollingIntervalMS?: number
@@ -8,6 +9,13 @@ type ConfigPollingOptions = {
     configCDNURI?: string
     cdnURI?: string
     clientMode?: boolean
+    disableRealtimeUpdates?: boolean
+}
+
+enum ConfigFetchState {
+    POLLING,
+    SSE,
+    DISABLED,
 }
 
 type SetIntervalInterface = (handler: () => void, timeout?: number) => any
@@ -19,18 +27,24 @@ export class EnvironmentConfigManager {
     private readonly logger: DVCLogger
     private readonly sdkKey: string
     private hasConfig = false
+
     configEtag?: string
     configLastModified?: string
+    configSSE?: ConfigBody<string>['sse']
+
     private readonly pollingIntervalMS: number
     private readonly requestTimeoutMS: number
     private readonly cdnURI: string
+    private readonly disableRealtimeUpdates: boolean
+
     fetchConfigPromise: Promise<void>
     private intervalTimeout?: any
-    private disablePolling = false
     private readonly setConfigBuffer: SetConfigBuffer
     private readonly setInterval: SetIntervalInterface
     private readonly clearInterval: ClearIntervalInterface
     private clientMode: boolean
+    private configFetchState: ConfigFetchState
+    private sseConnection?: SSEConnection
 
     constructor(
         logger: DVCLogger,
@@ -44,6 +58,7 @@ export class EnvironmentConfigManager {
             configCDNURI,
             cdnURI = 'https://config-cdn.devcycle.com',
             clientMode = false,
+            disableRealtimeUpdates = false,
         }: ConfigPollingOptions,
     ) {
         this.logger = logger
@@ -53,6 +68,10 @@ export class EnvironmentConfigManager {
         this.setInterval = setInterval
         this.clearInterval = clearInterval
         this.clientMode = clientMode
+        this.disableRealtimeUpdates = disableRealtimeUpdates
+        this.configFetchState = disableRealtimeUpdates
+            ? ConfigFetchState.POLLING
+            : ConfigFetchState.SSE
 
         this.pollingIntervalMS =
             configPollingIntervalMS >= 1000 ? configPollingIntervalMS : 1000
@@ -67,26 +86,126 @@ export class EnvironmentConfigManager {
                 this.logger.debug('DevCycle initial config loaded')
             })
             .finally(() => {
-                if (this.disablePolling) {
-                    return
-                }
-                this.intervalTimeout = this.setInterval(async () => {
-                    try {
-                        await this._fetchConfig()
-                    } catch (ex) {
-                        this.logger.error((ex as Error).message)
-                    }
-                }, this.pollingIntervalMS)
+                this.startWatchingForConfigChanges()
             })
     }
 
-    stopPolling(): void {
-        this.disablePolling = true
+    startWatchingForConfigChanges(): void {
+        if (this.configFetchState === ConfigFetchState.DISABLED) {
+            this.logger.warn(
+                'Config fetching is disabled to start watching for config changes',
+            )
+            return
+        }
+
+        if (this.disableRealtimeUpdates) {
+            this.startPolling()
+        } else {
+            this.startSSE()
+        }
+    }
+
+    stopWatchingForConfigChanges(): void {
+        this.configFetchState = ConfigFetchState.DISABLED
+        this.stopPolling()
+        this.stopSSE()
+    }
+
+    private startSSE(): void {
+        if (this.configFetchState === ConfigFetchState.POLLING) {
+            this.stopPolling()
+        }
+
+        if (!this.configSSE) {
+            this.logger.warn('No SSE configuration found, switching to polling')
+            this.startPolling()
+            return
+        }
+
+        this.configFetchState = ConfigFetchState.SSE
+        const url = new URL(
+            this.configSSE.path,
+            this.configSSE.hostname,
+        ).toString()
+        this.logger.debug(`Starting SSE connection to ${url}`)
+
+        this.sseConnection = new SSEConnection(
+            url,
+            this.logger,
+            this.onSSEMessage.bind(this),
+            () => {
+                this.logger.debug('SSE connection error, switching to polling')
+                this.startPolling()
+                this.stopSSE()
+            },
+        )
+    }
+
+    private onSSEMessage(message: string): void {
+        this.logger.debug(`SSE message: ${message}`)
+        try {
+            const parsedMessage = JSON.parse(message as string)
+            const messageData = JSON.parse(parsedMessage.data)
+
+            if (!messageData) {
+                return
+            }
+            if (!messageData.type || messageData.type === 'refetchConfig') {
+                if (!this.configEtag || messageData.etag !== this.configEtag) {
+                    this._fetchConfig()
+                        .then(() => {
+                            this.logger.debug('Config refetched')
+                        })
+                        .catch((e) => {
+                            this.logger.warn(`Failed to refetch config ${e}`)
+                        })
+
+                    // TODO: switch to config request consolidator? and check for etag / lastModified date
+                    // this.refetchConfig(
+                    //     true,
+                    //     messageData.lastModified,
+                    //     messageData.etag,
+                    // ).catch((e) => {
+                    //     this.logger.warn(`Failed to refetch config ${e}`)
+                    // })
+                }
+            }
+        } catch (e) {
+            this.logger.warn(`Streaming Connection: Unparseable message ${e}`)
+        }
+    }
+
+    private stopSSE(): void {
+        if (this.sseConnection) {
+            this.sseConnection.close()
+            this.sseConnection = undefined
+        }
+    }
+
+    private startPolling(): void {
+        if (this.configFetchState === ConfigFetchState.SSE) {
+            this.stopSSE()
+        }
+
+        if (this.intervalTimeout) return
+        this.configFetchState = ConfigFetchState.POLLING
+
+        this.intervalTimeout = this.setInterval(async () => {
+            try {
+                await this._fetchConfig()
+            } catch (ex) {
+                this.logger.error((ex as Error).message)
+            }
+        }, this.pollingIntervalMS)
+    }
+
+    private stopPolling(): void {
         this.clearInterval(this.intervalTimeout)
+        this.intervalTimeout = null
     }
 
     cleanup(): void {
-        this.stopPolling()
+        this.stopWatchingForConfigChanges()
     }
 
     getConfigURL(): string {
@@ -148,6 +267,15 @@ export class EnvironmentConfigManager {
             try {
                 const etag = res?.headers.get('etag') || ''
                 const lastModified = res?.headers.get('last-modified') || ''
+                if (this.configFetchState === ConfigFetchState.SSE) {
+                    const configBody = JSON.parse(
+                        projectConfig,
+                    ) as ConfigBody<string>
+                    this.configSSE = configBody.sse
+                } else {
+                    this.configSSE = undefined
+                }
+
                 this.setConfigBuffer(
                     `${this.sdkKey}${this.clientMode ? '_client' : ''}`,
                     projectConfig,
@@ -167,7 +295,7 @@ export class EnvironmentConfigManager {
                 `Failed to download config, using cached version. url: ${url}.`,
             )
         } else if (responseError?.status === 403) {
-            this.stopPolling()
+            this.stopWatchingForConfigChanges()
             throw new UserError(`Invalid SDK key provided: ${this.sdkKey}`)
         } else {
             throw new Error('Failed to download DevCycle config.')
