@@ -8,6 +8,7 @@ import {
     isValidString,
     getJSONObjFromJSONOptional,
     getStringFromJSONOptional,
+    getBoolFromJSON
 } from '../helpers/jsonHelpers'
 import { Feature } from './feature'
 import { Audience } from './target'
@@ -18,11 +19,11 @@ export class Settings extends JSON.Value {
     constructor(settings: JSON.Obj) {
         super();
         if (settings.has("disablePassthroughRollouts")) {
-            const value = settings.get("disablePassthroughRollouts");
-            this.disablePassthroughRollouts = !!value
+            this.disablePassthroughRollouts = getBoolFromJSON(settings, 'disablePassthroughRollouts')
         } else {
-            this.disablePassthroughRollouts = false
+            this.disablePassthroughRollouts = false;
         }
+
     }
     stringify(): string {
         const json = new JSON.Obj()
